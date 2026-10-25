@@ -2,6 +2,7 @@
 //! block interaction, inventory and HUD.
 mod advancements;
 mod advancements_screen;
+mod aei;
 mod agent;
 mod agent_settings;
 mod allays;
@@ -1456,6 +1457,8 @@ struct Game<'a> {
     spill: spill::Spill,
     /// The recipe book of the open screen (game/recipe_book.rs).
     recipe_ui: recipe_book::RecipeUi,
+    /// AEI's native item recipe/usage panel (`game/aei.rs`).
+    aei: aei::AeiState,
     /// The horse inventory (game/mount_menu.rs).
     mount_menu: mount_menu::MountMenu,
     /// The player's fishing hook.
@@ -5086,7 +5089,9 @@ impl Game<'_> {
             Screen::Mod => self.draw_mod_screen(&mut batch),
             Screen::Playing | Screen::Options | Screen::Win => {}
         }
-        self.draw_toasts(&mut batch);
+        if !self.draw_aei_notice(&mut batch) {
+            self.draw_toasts(&mut batch);
+        }
         self.draw_pack_toasts(&mut batch);
         self.remote_hud(&mut batch);
         self.draw_sign_editor(&mut batch);
@@ -5302,7 +5307,21 @@ impl Game<'_> {
         }
     }
     fn draw_inventory(&mut self, batch: &mut HudBatch) {
+        self.aei_sync_visibility();
+        if self.aei_modal() {
+            batch.fill(
+                &self.gui.atlas,
+                0.0,
+                0.0,
+                batch.width,
+                batch.height,
+                rgba(16, 16, 16, 160),
+            );
+            self.draw_aei_panel(batch);
+            return;
+        }
         if self.draw_station(batch) {
+            self.draw_aei_panel(batch);
             return;
         }
         let (ox, oy) = self.inventory_origin(batch);
@@ -5452,8 +5471,10 @@ impl Game<'_> {
         if self.container.is_none() && self.craft_size == 2 && !self.mount_active() {
             self.draw_inventory_effects(batch, (ox, oy), 176);
         }
+        self.draw_aei_panel(batch);
     }
     pub(super) fn close_container(&mut self) {
+        self.aei_close();
         self.close_station();
         self.mount_closed();
         self.recipe_ui.reset_screen();
@@ -5564,6 +5585,9 @@ impl Game<'_> {
     }
     /// Several clicks on one menu instance (a quick craft drag is three).
     fn menu_ops(&mut self, ops: &[(Option<usize>, i32, horizon_client::menu::Input)]) -> bool {
+        if self.spectator() {
+            return false;
+        }
         use horizon_client::menu::Input;
         if self.remote.is_some() && self.screen == Screen::Inventory {
             // On a server the clicks are the server's: predicted and sent.
@@ -6145,6 +6169,9 @@ impl Game<'_> {
     /// Number keys, F and Q over a slot of the open menu: SWAP with a hotbar
     /// slot or the off hand, THROW one or the whole stack.
     fn inventory_hotkey(&mut self, key: KeyCode) -> bool {
+        if self.spectator() || self.aei_modal() {
+            return false;
+        }
         use horizon_client::menu::Input;
         let Some(size) = self
             .renderer
@@ -6177,6 +6204,18 @@ impl Game<'_> {
     fn inventory_press(&mut self, right: bool) {
         use horizon_client::container_screen::Target;
         use horizon_client::menu::Input;
+        if let Some(size) = self
+            .renderer
+            .as_ref()
+            .map(|r| [r.config.width, r.config.height])
+            && self.aei_click(&HudBatch::new(size), right)
+        {
+            self.inv_clicks.skip_release();
+            return;
+        }
+        if self.spectator() {
+            return;
+        }
         if !right && self.sort_press() {
             return;
         }
@@ -6304,6 +6343,9 @@ impl Game<'_> {
     }
     /// Mouse movement while a quick craft drag is running.
     fn inventory_drag_move(&mut self) {
+        if self.spectator() || self.aei_modal() {
+            return;
+        }
         if self.tweaks_on() && self.tweak_drag_move(self.inventory_target().0) {
             return;
         }
@@ -6424,6 +6466,18 @@ impl Game<'_> {
     /// Mouse release over an inventory screen: `mouseReleased` ends or
     /// cancels the drag, drops a stack released outside, or clicks.
     fn inventory_mouse_release(&mut self, right: bool) {
+        self.aei_search_release();
+        if let Some(size) = self
+            .renderer
+            .as_ref()
+            .map(|r| [r.config.width, r.config.height])
+            && self.aei_navigation_release(&HudBatch::new(size), right)
+        {
+            return;
+        }
+        if self.spectator() || self.aei_modal() {
+            return;
+        }
         use horizon_client::container_screen::{Release, Target};
         self.tweak_release();
         let (slot, outside) = self.inventory_target();
@@ -6462,6 +6516,9 @@ impl Game<'_> {
     /// 2 that fills every slot it crosses; without infinite materials the
     /// press does nothing.
     fn inventory_pick_press(&mut self) {
+        if self.spectator() || self.aei_modal() {
+            return;
+        }
         use horizon_client::container_screen::{Button, Target};
         let (slot, outside) = self.inventory_target();
         let was_crafting = self.inv_clicks.quick_crafting().is_some();
@@ -6491,6 +6548,9 @@ impl Game<'_> {
     /// craft drag, cancels another button's, or clones onto the slot under a
     /// carried stack (`CLONE`, which only an item tab's display slot takes).
     fn inventory_pick_release(&mut self) {
+        if self.spectator() || self.aei_modal() {
+            return;
+        }
         use horizon_client::container_screen::{Button, Release, Target};
         let (slot, outside) = self.inventory_target();
         let dragged = self.inv_drag.as_ref().is_some_and(|(_, s)| !s.is_empty());
@@ -6513,6 +6573,9 @@ impl Game<'_> {
     }
     /// Mouse release: finishes a quick craft drag (one slot is a plain click).
     fn inventory_release(&mut self) {
+        if self.spectator() || self.aei_modal() {
+            return;
+        }
         use horizon_client::menu::Input;
         let Some((ty, slots)) = self.inv_drag.take() else {
             return;
@@ -6540,6 +6603,9 @@ impl Game<'_> {
         }
     }
     fn click_inventory(&mut self, right: bool) {
+        if self.spectator() {
+            return;
+        }
         if self.mount_click(right) {
             return;
         }
@@ -9517,6 +9583,19 @@ impl Game<'_> {
         batch.text(atlas, text, x, y, u32::MAX, true);
     }
     fn draw_creative(&mut self, batch: &mut HudBatch) {
+        self.aei_sync_visibility();
+        if self.aei_modal() {
+            batch.fill(
+                &self.gui.atlas,
+                0.0,
+                0.0,
+                batch.width,
+                batch.height,
+                rgba(16, 16, 16, 160),
+            );
+            self.draw_aei_panel(batch);
+            return;
+        }
         let (ox, oy) = Self::creative_origin(batch);
         let selected = self.creative_screen.selected;
         let tabs = self.creative_screen.tabs.clone();
@@ -9711,6 +9790,7 @@ impl Game<'_> {
             self.draw_tooltip_lines(batch, &lines, self.cursor.0, self.cursor.1);
         }
         self.draw_inventory_effects(batch, (ox, oy), Creative::WIDTH as i32);
+        self.draw_aei_panel(batch);
     }
     fn creative_trash_hovered(batch: &HudBatch, cursor: (f32, f32)) -> bool {
         let (ox, oy) = Self::creative_origin(batch);
@@ -9729,6 +9809,10 @@ impl Game<'_> {
             return;
         };
         let batch = HudBatch::new(size);
+        if self.aei_click(&batch, right) {
+            self.inv_clicks.skip_release();
+            return;
+        }
         let (ox, oy) = Self::creative_origin(&batch);
         let (cx, cy) = self.cursor;
         let tabs = self.creative_screen.tabs.clone();
@@ -10431,7 +10515,28 @@ impl Game<'_> {
             }
             return Ok(());
         }
-        if self.sort_key_press(key) {
+        if self.aei_container_screen()
+            && self.aei.open
+            && (key == KeyCode::Escape
+                || (self.aei_modal()
+                    && !self.aei_search_focused()
+                    && horizon_client::keybinds::key_code(self.settings.keys.get("key.inventory"))
+                        == Some(key)))
+        {
+            self.aei_search_blur();
+            if self.aei_modal() {
+                self.aei_open_catalogue();
+                return Ok(());
+            }
+        }
+        if self.aei_search_focused() {
+            self.aei_search_key_code(key);
+            return Ok(());
+        }
+        if self.aei_modal() && key != KeyCode::Escape {
+            return Ok(());
+        }
+        if !self.spectator() && self.sort_key_press(key) {
             return Ok(());
         }
         if self.remote.is_some() && self.remote_key(key)? {
@@ -10446,6 +10551,7 @@ impl Game<'_> {
                     self.capture(false);
                 }
                 Screen::Creative => {
+                    self.aei_close();
                     self.carried = None;
                     self.screen = Screen::Playing;
                     self.capture(true);
@@ -10498,7 +10604,12 @@ impl Game<'_> {
             KeyCode::KeyE
                 if self.screen == Screen::Creative && self.creative_screen.tab().search => {}
             KeyCode::KeyE => match self.screen {
-                Screen::Playing if self.spectator() => {}
+                Screen::Playing if self.spectator() => {
+                    if self.settings.extras.aei_enabled && self.settings.extras.aei_visible {
+                        self.screen = Screen::Inventory;
+                        self.capture(false);
+                    }
+                }
                 Screen::Playing => {
                     // key.inventory while riding a tamed mount opens its inventory.
                     if !self.open_ridden_mount_menu() {
@@ -10511,6 +10622,7 @@ impl Game<'_> {
                     }
                 }
                 Screen::Creative => {
+                    self.aei_close();
                     if let Some(c) = self.carried.take() {
                         let _ = self.give(c);
                     }
@@ -10900,9 +11012,14 @@ impl ApplicationHandler for Game<'_> {
                 self.physical_keys.remove(&key);
             }
         }
+        if let WindowEvent::MouseInput { state, button, .. } = &event {
+            self.aei_cycle_mouse(*button, *state == ElementState::Pressed);
+        }
         if let WindowEvent::Focused(false) = &event {
             self.physical_keys.clear();
+            self.aei_cycle_unfocus();
         }
+        self.aei_cycle_sync();
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
         }
@@ -11031,10 +11148,14 @@ impl ApplicationHandler for Game<'_> {
                     if let Some(r) = &self.renderer {
                         let b = HudBatch::new([r.config.width, r.config.height]);
                         self.cursor = (position.x as f32 / b.scale, position.y as f32 / b.scale);
+                        self.aei_search_drag();
                         if self.screen == Screen::Advancements {
                             self.advancements_drag();
                         }
-                        if self.screen == Screen::Creative {
+                        if self.screen == Screen::Creative
+                            && !self.aei_modal()
+                            && !self.aei_search_focused()
+                        {
                             let (_, oy) = Self::creative_origin(&b);
                             self.creative_screen.drag_scrollbar(self.cursor.1 - oy);
                         }
@@ -11114,14 +11235,19 @@ impl ApplicationHandler for Game<'_> {
                     if self.screen == Screen::Mod && d != 0.0 {
                         self.mod_screen_scroll(d);
                     }
-                    if self.screen == Screen::Creative && d != 0.0 {
-                        self.creative_screen.wheel(f64::from(d), &self.pack.names);
-                    }
-                    if self.screen == Screen::Inventory
-                        && d != 0.0
-                        && !self.tweak_scroll(d, self.inventory_target().0)
-                    {
-                        self.station_scroll(d);
+                    if self.aei_container_screen() && d != 0.0 {
+                        let aei_scrolled = self
+                            .renderer
+                            .as_ref()
+                            .map(|r| [r.config.width, r.config.height])
+                            .is_some_and(|size| self.aei_scroll(&HudBatch::new(size), d));
+                        if !aei_scrolled && !self.spectator() {
+                            if self.screen == Screen::Creative {
+                                self.creative_screen.wheel(f64::from(d), &self.pack.names);
+                            } else if !self.tweak_scroll(d, self.inventory_target().0) {
+                                self.station_scroll(d);
+                            }
+                        }
                     }
                     if self.screen == Screen::Stats && d != 0.0 {
                         self.stats_scroll(d);
@@ -11232,6 +11358,15 @@ impl ApplicationHandler for Game<'_> {
                 }
                 WindowEvent::MouseInput { state, button, .. } => {
                     let pressed = state == ElementState::Pressed;
+                    if self
+                        .aei_shortcut_action(&horizon_client::keybinds::mouse_name(button))
+                        .is_some()
+                    {
+                        if pressed {
+                            self.aei_shortcut(&horizon_client::keybinds::mouse_name(button));
+                        }
+                        return Ok(());
+                    }
                     if matches!(self.screen, Screen::Inventory | Screen::Creative)
                         && let Some(key) = self
                             .settings
@@ -11362,11 +11497,46 @@ impl ApplicationHandler for Game<'_> {
                         }
                     }
                 }
+                WindowEvent::KeyboardInput { event, .. }
+                    if (match event.physical_key {
+                        PhysicalKey::Code(key) => horizon_client::keybinds::key_name(key),
+                        _ => None,
+                    })
+                    .is_some_and(|input| self.aei_shortcut_action(input).is_some()) =>
+                {
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && let PhysicalKey::Code(key) = event.physical_key
+                        && let Some(input) = horizon_client::keybinds::key_name(key)
+                    {
+                        self.aei_shortcut(input);
+                    }
+                }
                 WindowEvent::KeyboardInput { event, .. } if self.sign_edit.is_some() => {
                     self.sign_edit_key(&event)
                 }
                 WindowEvent::KeyboardInput { event, .. } if self.book.is_some() => {
                     self.book_key(&event)
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if self.aei_container_screen()
+                        && self.aei.open
+                        && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
+                {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        self.key_pressed(KeyCode::Escape)?;
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. } if self.aei_search_focused() => {
+                    self.aei_search_key(&event)
+                }
+                WindowEvent::KeyboardInput { event, .. } if self.aei_modal() => {
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && let PhysicalKey::Code(key) = event.physical_key
+                    {
+                        self.key_pressed(key)?;
+                    }
                 }
                 WindowEvent::KeyboardInput { event, .. }
                     if self.screen == Screen::Creative
@@ -11421,9 +11591,16 @@ impl ApplicationHandler for Game<'_> {
                 }
                 // Options consumes presses; releases still reach the bound
                 // gameplay mapping below, including sneak/sprint toggles.
-                WindowEvent::KeyboardInput { event, .. }
-                    if self.screen == Screen::Options && event.state == ElementState::Pressed =>
-                {
+                WindowEvent::KeyboardInput { event, .. } if self.screen == Screen::Options => {
+                    if event.state == ElementState::Released {
+                        if let PhysicalKey::Code(key) = event.physical_key {
+                            self.options_key_released(key)?;
+                            if let Some(Ok(mapped)) = self.settings.keys.translate(key) {
+                                self.mapped_key(mapped, false, false)?;
+                            }
+                        }
+                        return Ok(());
+                    }
                     if let Some(shortcut) = self.edit_shortcut(&event)
                         && self.options_shortcut(shortcut)
                     {
@@ -11511,6 +11688,7 @@ impl ApplicationHandler for Game<'_> {
                         .and_then(|_| horizon_client::spans::thread_cpu());
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
+                    self.aei_cycle_sync();
                     self.previous = now;
                     // Arrow-key camera controls belong to gameplay; chat and
                     // other screens use the same keys for their own navigation.
@@ -12047,6 +12225,7 @@ impl<'a> Game<'a> {
             pending: Default::default(),
             spill: Default::default(),
             recipe_ui: Default::default(),
+            aei: Default::default(),
             mount_menu: Default::default(),
             hook: None,
             remote_hooks: Vec::new(),

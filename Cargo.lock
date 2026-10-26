@@ -1300,6 +1300,7 @@ dependencies = [
  "horizon-mods",
  "horizon-protocol",
  "horizon-server-files",
+ "horizon-shader-api",
  "horizon-shaders",
  "horizon-telemetry",
  "horizon-theme",

@@ -67,6 +67,7 @@ mod end_sky;
 mod flat;
 pub mod lightning;
 mod lod;
+mod native_post;
 mod occlusion;
 mod pack_atlas;
 mod pack_post;
@@ -471,8 +472,10 @@ pub struct Renderer {
     occlusion: occlusion::Occlusion,
     /// Resolution scale and FXAA (Horizon settings).
     world_post: world_post::Post,
-    /// The shader pack's post-processing, and the dimension (legacy id) it was loaded for.
-    pack_post: Option<(i32, Option<pack_post::PackPost>)>,
+    /// The post-processing chain over the world, if any (`world_post::Chain`).
+    post_chain: Option<world_post::Chain>,
+    /// The dimension (legacy id) the shader pack was last set for.
+    shader_pack_dimension: Option<i32>,
     /// The block sprites as one atlas, while a shader pack is loaded.
     pack_atlas: Option<pack_atlas::PackAtlas>,
     pub hud: HudRenderer,
@@ -2361,7 +2364,8 @@ impl Renderer {
             block_entity_revision: next_block_entity_revision(),
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             world_post,
-            pack_post: None,
+            post_chain: None,
+            shader_pack_dimension: None,
             pack_atlas: None,
             hud,
             menu_blur: None,
@@ -2831,12 +2835,43 @@ impl Renderer {
             let programs = p.programs().into_iter().map(str::to_owned).collect();
             (programs, p.notes.clone())
         });
-        self.pack_post = Some((dimension, post));
+        self.post_chain = post.map(world_post::Chain::Java);
+        self.shader_pack_dimension = Some(dimension);
         report
+    }
+    /// Runs the post passes of one of Horizon's own shader packs over the world from now on
+    /// (`None`: no pack), with its options' values; replaces any other chain. Returns the
+    /// passes' labels; on an error the chain that ran keeps running.
+    pub fn set_native_shader_pack(
+        &mut self,
+        pack: Option<(horizon_shader_api::Report, Vec<(String, f64)>)>,
+    ) -> std::result::Result<Vec<String>, String> {
+        let Some((report, constants)) = pack else {
+            if matches!(self.post_chain, Some(world_post::Chain::Native(_))) {
+                self.post_chain = None;
+            }
+            return Ok(Vec::new());
+        };
+        let post: Vec<_> = report
+            .stages
+            .into_iter()
+            .filter(|s| s.kind == horizon_shader_api::StageKind::Post)
+            .collect();
+        if post.is_empty() {
+            self.post_chain = None;
+            return Ok(Vec::new());
+        }
+        let format = self.config.format.remove_srgb_suffix();
+        let post = native_post::NativePost::new(&self.device, post, &constants, format)?;
+        let labels = post.labels().into_iter().map(str::to_owned).collect();
+        self.pack_atlas = None;
+        self.shader_pack_dimension = None;
+        self.post_chain = Some(world_post::Chain::Native(post));
+        Ok(labels)
     }
     /// The dimension the shader pack was last set for.
     pub fn shader_pack_dimension(&self) -> Option<i32> {
-        self.pack_post.as_ref().map(|p| p.0)
+        self.shader_pack_dimension
     }
     /// The Mipmap Levels option: block textures sample at most `levels`
     /// reduced copies (0: none).
@@ -3712,11 +3747,11 @@ impl Renderer {
             timer.begin(&mut encoder);
         }
         // The world's targets: the screen, or the scaled target of `post`.
-        let pack_post = !frame.title && self.pack_post.as_ref().is_some_and(|p| p.1.is_some());
+        let post_chain = !frame.title && self.post_chain.is_some();
         let scaled = self.world_post.prepare(
             &self.device,
             [self.config.width, self.config.height],
-            pack_post,
+            post_chain,
         );
         let (world_view, world_depth) = match &scaled {
             Some((color, depth)) => (color, depth),
@@ -3754,8 +3789,8 @@ impl Renderer {
                     view: world_depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
-                        // Phase 2 of occlusion culling draws over it; a shader pack reads it.
-                        store: if cull.is_some() || pack_post {
+                        // Phase 2 of occlusion culling draws over it; a post chain reads it.
+                        store: if cull.is_some() || post_chain {
                             wgpu::StoreOp::Store
                         } else {
                             wgpu::StoreOp::Discard
@@ -3818,7 +3853,7 @@ impl Renderer {
                                 &mut encoder,
                                 world_view,
                                 world_depth,
-                                pack_post,
+                                post_chain,
                             );
                             pass.set_bind_group(0, &self.group, &[]);
                             pass.set_pipeline(&flat.solid);
@@ -3847,7 +3882,7 @@ impl Renderer {
                                 &mut encoder,
                                 world_view,
                                 world_depth,
-                                pack_post,
+                                post_chain,
                             );
                             pass.set_bind_group(0, &self.group, &[]);
                             pass.set_pipeline(&self.solid);
@@ -4024,19 +4059,17 @@ impl Renderer {
             }
         }
         if let Some((color, depth)) = &scaled
-            && pack_post
-            && let Some((_, Some(post))) = &mut self.pack_post
+            && post_chain
+            && let Some(chain) = &mut self.post_chain
         {
             let size = self.world_post.size().unwrap_or([1, 1]);
-            post.run(
+            chain.run(
                 &self.device,
                 &self.queue,
                 &mut encoder,
-                color,
-                depth,
+                (color, depth),
                 &view_target,
                 frame,
-                &frame.pack,
                 size,
                 [self.config.width, self.config.height],
             );

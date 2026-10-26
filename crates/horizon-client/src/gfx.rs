@@ -71,6 +71,7 @@ mod occlusion;
 mod pack_atlas;
 pub mod pack_draw;
 mod pack_entities;
+mod pack_hand;
 mod pack_post;
 mod pack_sky;
 mod pack_timing;
@@ -2842,6 +2843,7 @@ impl Renderer {
                     .map(|t| t.create_view(&Default::default())),
                 clouds: Some(&self.cloud_bindings),
                 weather: true,
+                hand: true,
             };
             pack_post::PackPost::new(
                 &self.device,
@@ -2868,6 +2870,7 @@ impl Renderer {
             entities: Some(pack_entities::inputs()),
             clouds: Some(pack_entities::cloud_inputs()),
             weather: Some(pack_weather::inputs()),
+            hand: Some(pack_hand::inputs()),
         }
     }
 
@@ -3825,6 +3828,12 @@ impl Renderer {
                 .as_ref()
                 .and_then(|p| p.1.as_ref())
                 .is_some_and(|p| p.has_clouds());
+        let pack_draws_hand = pack_post
+            && self
+                .pack_post
+                .as_ref()
+                .and_then(|p| p.1.as_ref())
+                .is_some_and(|p| p.has_hand());
         let pack_draws_weather = pack_post
             && self
                 .pack_post
@@ -4214,7 +4223,7 @@ impl Renderer {
         } else if scaled.is_some() {
             self.world_post.finish(&mut encoder, &view_target);
         }
-        if hand_quads > 0 {
+        if hand_quads > 0 && !pack_draws_hand {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: &view_target,
                 resolve_target: None,
